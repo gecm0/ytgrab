@@ -231,6 +231,42 @@ fn fetch_thumb(job_id: usize, video_id: &str, ui: &Sender<Msg>) {
     });
 }
 
+/// yt-dlp's arguments. The URL must come last, after "--": anything after "--" is taken as a URL.
+fn ytdlp_args(dir: &Path, cookie_file: &Path, ffmpeg: Option<&Path>, url: &str) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = [
+        "-f",
+        FORMAT,
+        "--merge-output-format",
+        "mkv",
+        "--newline",
+        "--no-playlist",
+        "--embed-metadata",
+        // --print would imply --quiet/--simulate; keep progress lines and the real download.
+        "--no-quiet",
+        "--no-simulate",
+        // A Windows pipe gets the ANSI code page by default: accented titles turned into bytes that
+        // are not UTF-8, which stopped our reader, closed the pipe, and made yt-dlp's next write fail
+        // with "[Errno 22] Invalid argument". yt-dlp encodes all its output with this instead.
+        "--encoding",
+        "utf-8",
+        "--print",
+        "before_dl:YTGRAB_INFO %(id)s %(title)s",
+        "--print",
+        "after_move:YTGRAB_FILE %(filepath)s",
+        "-o",
+        "%(title)s [%(id)s].%(ext)s",
+    ]
+    .map(Into::into)
+    .into();
+    args.extend(["-P".into(), dir.into(), "--cookies".into(), cookie_file.into()]);
+    if let Some(ffmpeg) = ffmpeg {
+        args.extend(["--ffmpeg-location".into(), ffmpeg.into()]);
+    }
+    // The URL comes from an HTTP body; "--" keeps it from ever being parsed as a flag.
+    args.extend(["--".into(), url.into()]);
+    args
+}
+
 fn run_job(job: &Job, dir: &Path, version: &str, ui: &Sender<Msg>) -> Result<(), Failure> {
     let cookie_file = std::env::temp_dir().join(format!("ytgrab-cookies-{}.txt", job.id));
     std::fs::write(&cookie_file, &job.cookies).map_err(|e| Failure {
@@ -238,30 +274,13 @@ fn run_job(job: &Job, dir: &Path, version: &str, ui: &Sender<Msg>) -> Result<(),
         detail: format!("Writing {}: {e}", cookie_file.display()),
     })?;
 
+    // Bundled ffmpeg lives in bin/ too; yt-dlp only searches PATH by default.
+    let ffmpeg = Some(tool("ffmpeg")).filter(|p| p.is_absolute());
     let mut cmd = command(tool("yt-dlp"));
-    cmd.args(["-f", FORMAT, "--merge-output-format", "mkv", "--newline", "--no-playlist", "--embed-metadata"])
-        // --print would imply --quiet/--simulate; keep progress lines and the real download.
-        .args(["--no-quiet", "--no-simulate"])
-        // A Windows pipe gets the ANSI code page by default: accented titles turned into bytes that
-        // are not UTF-8, which stopped our reader, closed the pipe, and made yt-dlp's next write fail
-        // with "[Errno 22] Invalid argument". yt-dlp encodes all its output with this instead.
-        .args(["--encoding", "utf-8"])
-        .args(["--print", "before_dl:YTGRAB_INFO %(id)s %(title)s"])
-        .args(["--print", "after_move:YTGRAB_FILE %(filepath)s"])
-        .arg("-P")
-        .arg(dir)
-        .args(["-o", "%(title)s [%(id)s].%(ext)s"])
-        .arg("--cookies")
-        .arg(&cookie_file)
-        .arg("--") // the URL comes from an HTTP body; never let it be parsed as a flag
-        .arg(&job.url)
+    cmd.args(ytdlp_args(dir, &cookie_file, ffmpeg.as_deref(), &job.url))
         .stdin(Stdio::null()) // GUI app has no console; don't hand Python a dead stdin
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    // Bundled ffmpeg lives in bin/ too; yt-dlp only searches PATH by default.
-    if let Some(ffmpeg) = Some(tool("ffmpeg")).filter(|p| p.is_absolute()) {
-        cmd.arg("--ffmpeg-location").arg(ffmpeg);
-    }
 
     let result = (|| {
         let mut child = cmd.spawn().map_err(|e| Failure {
@@ -994,6 +1013,19 @@ mod tests {
         save_download_dir(Path::new("/some/where")).unwrap();
         assert_eq!(load_download_dir(), PathBuf::from("/some/where"));
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn url_is_the_last_argument() {
+        let ffmpeg = Path::new("C:/ytgrab/bin/ffmpeg.exe");
+        for ff in [Some(ffmpeg), None] {
+            let args = ytdlp_args(Path::new("D:/Descargas"), Path::new("c.txt"), ff, "https://youtu.be/abc");
+            let n = args.len();
+            assert_eq!(args[n - 2], "--");
+            assert_eq!(args[n - 1], "https://youtu.be/abc");
+            assert_eq!(args.iter().filter(|a| *a == "--").count(), 1);
+            assert_eq!(args.iter().any(|a| a == "--ffmpeg-location"), ff.is_some());
+        }
     }
 
     #[test]
