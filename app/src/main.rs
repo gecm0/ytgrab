@@ -3,12 +3,13 @@
 
 use gpui::{
     App, Application, Bounds, Context, Div, ElementId, FocusHandle, FontWeight, KeyBinding, MouseButton,
-    PathPromptOptions, Stateful, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div, img, prelude::*,
-    px, rgb, size, transparent_black,
+    PathPromptOptions, SharedString, Stateful, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div, img,
+    prelude::*, px, rgb, size, transparent_black,
 };
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -21,7 +22,14 @@ const MAX_BODY: usize = 1 << 20; // cookies for youtube.com fit easily in 1 MB
 // Same codec on every download: VP9 video + Opus audio, muxed into MKV.
 const FORMAT: &str = "bv[vcodec~='^(vp9|vp09)']+ba[acodec=opus]";
 
-actions!(ytgrab, [FocusNext, FocusPrev]);
+actions!(ytgrab, [FocusNext, FocusPrev, Paste]);
+
+/// Job ids for both the extension and pasted links; ids also name the cookie temp files.
+static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
+
+fn next_id() -> usize {
+    NEXT_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 struct Job {
     id: usize,
@@ -39,6 +47,8 @@ enum Kind {
 /// One short line for the status bar; `detail` (full error text) shows behind "Details".
 const FAILED: &str = "Download failed";
 const RETRYING: &str = "Retrying…";
+// secondary-v in the key bindings: Cmd on macOS, Ctrl elsewhere.
+const PASTE_KEY: &str = if cfg!(target_os = "macos") { "⌘V" } else { "Ctrl+V" };
 
 struct Status {
     kind: Kind,
@@ -146,8 +156,13 @@ fn parse_job(
     Ok((url.to_string(), cookies.to_string()))
 }
 
+/// Clipboard text -> the YouTube URL in it, if that is all it holds.
+fn pasted_url(text: &str) -> Option<&str> {
+    let url = text.trim();
+    (is_youtube_url(url) && !url.contains(char::is_whitespace)).then_some(url)
+}
+
 fn serve(server: tiny_http::Server, jobs: Sender<Job>, ui: Sender<Msg>) {
-    let mut next_id = 0;
     for mut req in server.incoming_requests() {
         let origin = req.headers().iter().find(|h| h.field.equiv("Origin")).map(|h| h.value.as_str().to_string());
         let mut body = Vec::new();
@@ -160,9 +175,9 @@ fn serve(server: tiny_http::Server, jobs: Sender<Job>, ui: Sender<Msg>) {
         };
         let (code, text) = match result {
             Ok((url, cookies)) => {
-                next_id += 1;
-                let _ = ui.send(Msg::New { id: next_id, url: url.clone(), cookies: cookies.clone() });
-                let _ = jobs.send(Job { id: next_id, url, cookies });
+                let id = next_id();
+                let _ = ui.send(Msg::New { id, url: url.clone(), cookies: cookies.clone() });
+                let _ = jobs.send(Job { id, url, cookies });
                 (202, "queued")
             }
             Err(e) => e,
@@ -232,7 +247,7 @@ fn fetch_thumb(job_id: usize, video_id: &str, ui: &Sender<Msg>) {
 }
 
 /// yt-dlp's arguments. The URL must come last, after "--": anything after "--" is taken as a URL.
-fn ytdlp_args(dir: &Path, cookie_file: &Path, ffmpeg: Option<&Path>, url: &str) -> Vec<std::ffi::OsString> {
+fn ytdlp_args(dir: &Path, cookie_file: Option<&Path>, ffmpeg: Option<&Path>, url: &str) -> Vec<std::ffi::OsString> {
     let mut args: Vec<std::ffi::OsString> = [
         "-f",
         FORMAT,
@@ -258,7 +273,10 @@ fn ytdlp_args(dir: &Path, cookie_file: &Path, ffmpeg: Option<&Path>, url: &str) 
     ]
     .map(Into::into)
     .into();
-    args.extend(["-P".into(), dir.into(), "--cookies".into(), cookie_file.into()]);
+    args.extend(["-P".into(), dir.into()]);
+    if let Some(cookie_file) = cookie_file {
+        args.extend(["--cookies".into(), cookie_file.into()]);
+    }
     if let Some(ffmpeg) = ffmpeg {
         args.extend(["--ffmpeg-location".into(), ffmpeg.into()]);
     }
@@ -269,19 +287,23 @@ fn ytdlp_args(dir: &Path, cookie_file: &Path, ffmpeg: Option<&Path>, url: &str) 
 
 fn run_job(job: &Job, dir: &Path, version: &str, ui: &Sender<Msg>) -> Result<(), Failure> {
     let cookie_file = std::env::temp_dir().join(format!("ytgrab-cookies-{}.txt", job.id));
-    std::fs::write(&cookie_file, &job.cookies).map_err(|e| {
-        // A partial write (disk full) can still hold live cookies: delete it here too.
-        let _ = std::fs::remove_file(&cookie_file);
-        Failure {
-            short: "Cannot write a temporary file. Check free space on the system drive.".into(),
-            detail: format!("Writing {}: {e}", cookie_file.display()),
-        }
-    })?;
+    // A pasted link before any extension job has no cookies; yt-dlp rejects an empty cookies file.
+    let use_cookies = !job.cookies.is_empty();
+    if use_cookies {
+        std::fs::write(&cookie_file, &job.cookies).map_err(|e| {
+            // A partial write (disk full) can still hold live cookies: delete it here too.
+            let _ = std::fs::remove_file(&cookie_file);
+            Failure {
+                short: "Cannot write a temporary file. Check free space on the system drive.".into(),
+                detail: format!("Writing {}: {e}", cookie_file.display()),
+            }
+        })?;
+    }
 
     // Bundled ffmpeg lives in bin/ too; yt-dlp only searches PATH by default.
     let ffmpeg = Some(tool("ffmpeg")).filter(|p| p.is_absolute());
     let mut cmd = command(tool("yt-dlp"));
-    cmd.args(ytdlp_args(dir, &cookie_file, ffmpeg.as_deref(), &job.url))
+    cmd.args(ytdlp_args(dir, use_cookies.then_some(cookie_file.as_path()), ffmpeg.as_deref(), &job.url))
         .stdin(Stdio::null()) // GUI app has no console; don't hand Python a dead stdin
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -362,13 +384,13 @@ fn explain(stderr: &str) -> String {
     } else if has(&["errno 22", "invalid argument"]) {
         "Windows refused a file write (invalid argument). Retry; if it fails again, send screenshots of Details (scroll to the end)."
     } else if has(&["not a bot"]) {
-        "YouTube asked to confirm you are not a bot. Sign in to YouTube in Chrome, wait a while, then click Download on the video again."
+        "YouTube asked to confirm you are not a bot. Sign in to YouTube in Chrome, wait a while, then click Download on the video in Chrome so ytgrab gets your login."
     } else if has(&["confirm your age", "age-restricted", "inappropriate for some users"]) {
-        "This video has an age check. Sign in to YouTube in Chrome, then click Download on the video again."
+        "This video has an age check. Sign in to YouTube in Chrome, then click Download on the video in Chrome so ytgrab gets your login."
     } else if has(&["private video"]) {
         "This video is private."
     } else if has(&["members-only", "join this channel", "sign in"]) {
-        "This video needs you signed in. Sign in to YouTube in Chrome, then click Download on the video again."
+        "This video needs you signed in. Sign in to YouTube in Chrome, then click Download on the video in Chrome so ytgrab gets your login."
     } else if has(&["video unavailable", "video is unavailable", "has been removed", "not available in your country"]) {
         "This video is unavailable (removed, blocked or not available in your country)."
     } else if has(&["requested format is not available"]) {
@@ -503,6 +525,14 @@ struct Main {
     dir: Arc<Mutex<PathBuf>>,
     rows: Vec<Row>,
     jobs: Sender<Job>,
+    /// False when the port was taken: then no worker runs and nothing may be queued.
+    working: bool,
+    /// The cookies of the extension's latest job, reused for pasted links. Memory only.
+    last_cookies: String,
+    /// Result of the last paste, shown under the header for a few seconds: (color, text).
+    note: Option<(u32, &'static str)>,
+    /// Bumped per note so an old timer doesn't clear a newer note.
+    note_gen: usize,
     focus: FocusHandle,
     /// Focus ring only after Tab, like CSS :focus-visible; a mouse click hides it again.
     ring: bool,
@@ -573,6 +603,7 @@ impl Main {
             return;
         }
         if let Msg::New { id, url, cookies } = msg {
+            self.last_cookies = cookies.clone();
             self.rows.push(Row {
                 id,
                 title: url.clone(),
@@ -636,6 +667,36 @@ impl Main {
         let _ = self.jobs.send(Job { id, url: r.url.clone(), cookies: r.cookies.clone() });
     }
 
+    /// Queues the link on the clipboard the same way the extension's request is queued.
+    fn paste(&mut self, cx: &mut Context<Self>) {
+        let text = cx.read_from_clipboard().and_then(|c| c.text()).unwrap_or_default();
+        let note = match pasted_url(&text) {
+            // No worker without the port, so a job would sit in "Queued" forever.
+            _ if !self.working => (AMBER, "Can’t add links while another ytgrab is open."),
+            None => (AMBER, "The clipboard has no YouTube link. Copy one from the address bar or Share."),
+            Some(url) => {
+                let (id, url, cookies) = (next_id(), url.to_string(), self.last_cookies.clone());
+                let _ = self.jobs.send(Job { id, url: url.clone(), cookies: cookies.clone() });
+                self.apply(Msg::New { id, url, cookies });
+                (GREEN, "Added to the queue.")
+            }
+        };
+        self.note = Some(note);
+        self.note_gen += 1;
+        let gen_ = self.note_gen;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(4)).await;
+            let _ = this.update(cx, |main: &mut Main, cx| {
+                if main.note_gen == gen_ {
+                    main.note = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
     fn choose_dir(&mut self, cx: &mut Context<Self>) {
         let picked = cx.prompt_for_paths(PathPromptOptions {
             files: false,
@@ -671,7 +732,8 @@ impl Render for Main {
             .items_center()
             .gap_2()
             .px_4()
-            .py_3()
+            .pt_3()
+            .pb_2()
             .child(
                 div()
                     .flex()
@@ -681,8 +743,33 @@ impl Render for Main {
                     .child(div().flex_none().text_color(rgb(MUTED)).child("Saving to"))
                     .child(div().min_w_0().truncate().child(tilde(&dir))),
             )
+            .child(
+                button_base("paste", "Add from clipboard", ring)
+                    .gap_2()
+                    .bg(rgb(RAISED))
+                    .text_color(rgb(TEXT))
+                    .hover(|s| s.bg(rgb(RAISED_HOVER)))
+                    .active(|s| s.bg(rgb(RAISED)))
+                    .child(div().text_xs().text_color(rgb(MUTED)).child(PASTE_KEY))
+                    .on_click(cx.listener(|this, _, _, cx| this.paste(cx))),
+            )
             .child(ghost("change-dir", "Change…", ring).on_click(cx.listener(|this, _, _, cx| this.choose_dir(cx))))
             .child(button("open-dir", "Open folder", ring).on_click(move |_, _, cx| cx.open_with_system(&dir)));
+
+        // Always one line tall, hint or result, so nothing below moves when a result appears.
+        let (note_color, note_text) = match self.note {
+            Some((color, text)) => (color, SharedString::from(text)),
+            None => (MUTED, format!("Copy a YouTube link, then press {PASTE_KEY} anywhere in this window.").into()),
+        };
+        let note = div()
+            .flex_none()
+            .h(px(16.))
+            .px_4()
+            .mb_2()
+            .text_xs()
+            .text_color(rgb(note_color))
+            .truncate()
+            .child(note_text);
 
         let rows = self.rows.iter().rev().map(|r| {
             // 16:9 preview; grey box until the thumbnail arrives.
@@ -775,13 +862,9 @@ impl Render for Main {
                 .gap_1()
                 .p_6()
                 .child(div().text_size(px(14.)).font_weight(FontWeight::MEDIUM).child("No downloads yet"))
-                .child(
-                    div()
-                        .max_w(px(300.))
-                        .text_center()
-                        .text_color(rgb(MUTED))
-                        .child("Click Download under any YouTube video, or the ytgrab icon in Chrome’s toolbar."),
-                )
+                .child(div().max_w(px(340.)).text_center().text_color(rgb(MUTED)).child(
+                    "Copy a YouTube link and press Add from clipboard, or click Download under a video in Chrome.",
+                ))
                 .into_any_element()
         } else {
             div().id("jobs").flex().flex_col().flex_1().overflow_y_scroll().children(rows).into_any_element()
@@ -863,6 +946,7 @@ impl Render for Main {
                 this.ring = true;
                 cx.notify();
             }))
+            .on_action(cx.listener(|this, _: &Paste, _, cx| this.paste(cx)))
             .on_action(cx.listener(|this, _: &FocusPrev, window, cx| {
                 window.focus_prev();
                 this.ring = true;
@@ -884,6 +968,7 @@ impl Render for Main {
             .text_color(rgb(TEXT))
             .text_size(px(13.))
             .child(header)
+            .child(note)
             .child(list)
             .child(status_bar)
     }
@@ -896,21 +981,27 @@ fn main() {
 
     // Bind before starting anything else: without the port no job can ever arrive, so this warning
     // must stay on screen instead of being replaced by the worker's yt-dlp update status.
-    let first_status = match tiny_http::Server::http(("127.0.0.1", PORT)) {
+    let (first_status, working) = match tiny_http::Server::http(("127.0.0.1", PORT)) {
         Ok(server) => {
             let (ui, jobs) = (ui_tx.clone(), job_tx.clone());
             std::thread::spawn(move || serve(server, jobs, ui));
             let dir = dir.clone();
             std::thread::spawn(move || work(job_rx, dir, ui_tx));
-            status(Kind::Busy, "Starting…", "")
+            (status(Kind::Busy, "Starting…", ""), true)
         }
         Err(e) => {
-            status(Kind::Warn, format!("Cannot listen on 127.0.0.1:{PORT}. Is ytgrab already open?"), e.to_string())
+            let text = format!("Cannot listen on 127.0.0.1:{PORT}. Is ytgrab already open?");
+            (status(Kind::Warn, text, e.to_string()), false)
         }
     };
 
     Application::new().run(move |cx: &mut App| {
-        cx.bind_keys([KeyBinding::new("tab", FocusNext, None), KeyBinding::new("shift-tab", FocusPrev, None)]);
+        cx.bind_keys([
+            KeyBinding::new("tab", FocusNext, None),
+            KeyBinding::new("shift-tab", FocusPrev, None),
+            // secondary = Cmd on macOS, Ctrl elsewhere.
+            KeyBinding::new("secondary-v", Paste, None),
+        ]);
         let bounds = Bounds::centered(None, size(px(720.), px(520.)), cx);
         cx.open_window(
             WindowOptions {
@@ -947,6 +1038,10 @@ fn main() {
                         dir,
                         rows: Vec::new(),
                         jobs: job_tx,
+                        working,
+                        last_cookies: String::new(),
+                        note: None,
+                        note_gen: 0,
                         focus: cx.focus_handle(),
                         ring: false,
                     }
@@ -1029,14 +1124,27 @@ mod tests {
     #[test]
     fn url_is_the_last_argument() {
         let ffmpeg = Path::new("C:/ytgrab/bin/ffmpeg.exe");
-        for ff in [Some(ffmpeg), None] {
-            let args = ytdlp_args(Path::new("D:/Descargas"), Path::new("c.txt"), ff, "https://youtu.be/abc");
+        let cookies = Path::new("c.txt");
+        for (ff, c) in [(Some(ffmpeg), Some(cookies)), (None, Some(cookies)), (Some(ffmpeg), None), (None, None)] {
+            let args = ytdlp_args(Path::new("D:/Descargas"), c, ff, "https://youtu.be/abc");
             let n = args.len();
             assert_eq!(args[n - 2], "--");
             assert_eq!(args[n - 1], "https://youtu.be/abc");
             assert_eq!(args.iter().filter(|a| *a == "--").count(), 1);
             assert_eq!(args.iter().any(|a| a == "--ffmpeg-location"), ff.is_some());
+            // yt-dlp rejects an empty cookies file, so no cookies means no --cookies at all.
+            assert_eq!(args.iter().any(|a| a == "--cookies"), c.is_some());
         }
+    }
+
+    #[test]
+    fn pasted_links() {
+        assert_eq!(pasted_url("  https://youtu.be/abc\n"), Some("https://youtu.be/abc"));
+        assert_eq!(pasted_url("https://www.youtube.com/watch?v=abc"), Some("https://www.youtube.com/watch?v=abc"));
+        assert_eq!(pasted_url("www.youtube.com/watch?v=abc"), None);
+        assert_eq!(pasted_url("https://www.youtube.com/watch?v=a https://evil.com"), None);
+        assert_eq!(pasted_url("-o /tmp/x"), None);
+        assert_eq!(pasted_url(""), None);
     }
 
     #[test]
@@ -1101,10 +1209,11 @@ mod tests {
             let got = explain(stderr);
             assert!(got.contains(want), "{stderr}\n-> {got}");
         }
-        // Retry reuses the row's old cookies, so sign-in fixes must say "Download again", not "Retry".
+        // Retry reuses the row's old cookies (none for a pasted link), so sign-in fixes must point to
+        // the Download button in Chrome, not to Retry.
         for m in [AGE, "ERROR: [youtube] x: Sign in to confirm you\u{2019}re not a bot.", "ERROR: x: Join this channel"]
         {
-            assert!(explain(m).contains("click Download on the video again"), "{m}");
+            assert!(explain(m).contains("click Download on the video in Chrome"), "{m}");
         }
         use std::io::{Error, ErrorKind};
         assert!(spawn_failure(&Error::from(ErrorKind::NotFound)).short.contains("missing"));

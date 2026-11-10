@@ -65,6 +65,8 @@ Keep the app open, go to a YouTube video and click **Download**. The button tell
 | Not a video | `YT?` | You are not on a video page |
 | Error | `ERR` | Something else failed |
 
+No extension? Copy a YouTube link and press **Add from clipboard** (or Cmd/Ctrl+V) in the app. Pasted links reuse the cookies of the extension's latest download in this session, kept in memory only; before that they download signed out, so age-restricted, private and members-only videos fail.
+
 Files go to `~/Downloads` by default. Pick another folder with **Change…** in the app.
 
 ## Good to know
