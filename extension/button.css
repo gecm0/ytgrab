@@ -1,0 +1,25 @@
+/* Match YouTube's pill buttons (Like, Share) using its own theme variables, so dark mode works.
+   YouTube dropped the old --yt-spec-* names in 2026; --yt-sys-color-baseline--* is what Share uses now. */
+#ytgrab-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 36px;
+  margin-left: 8px;
+  padding: 0 16px 0 12px;
+  border: none;
+  border-radius: 18px;
+  background: var(--yt-sys-color-baseline--additive-background, rgba(0, 0, 0, 0.05));
+  color: var(--yt-sys-color-baseline--text-primary, #0f0f0f);
+  font: 500 14px/36px "Roboto", "Arial", sans-serif;
+  white-space: nowrap;
+  cursor: pointer;
+}
+#ytgrab-btn:hover { background: var(--yt-sys-color-baseline--mono-tonal-hover, rgba(0, 0, 0, 0.1)); }
+#ytgrab-btn:focus-visible { outline: 2px solid var(--yt-sys-color-baseline--call-to-action, #065fd4); outline-offset: 2px; }
+/* No theme variable for a pressed shade; dimming works on both the light and dark fills. */
+#ytgrab-btn:active { filter: brightness(0.85); }
+#ytgrab-btn[aria-disabled="true"] { cursor: default; opacity: 0.8; }
+#ytgrab-btn img { width: 20px; height: 20px; }
+/* Wide enough for the longest result ("Not a video"), so YouTube's button row doesn't shift. */
+#ytgrab-btn span { min-width: 11ch; text-align: center; }
