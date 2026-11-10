@@ -588,6 +588,16 @@ fn ghost(id: impl Into<ElementId>, label: &'static str, ring: bool) -> Stateful<
         .active(|s| s.bg(rgb(RAISED_HOVER)).text_color(rgb(TEXT)))
 }
 
+/// Hover hint for a control whose label doesn't say what it does.
+struct Tip(&'static str);
+
+impl Render for Tip {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let tip = div().px_2().py_1().rounded(px(6.)).border_1().border_color(rgb(LINE)).bg(rgb(RAISED));
+        tip.text_xs().text_color(rgb(TEXT)).child(self.0)
+    }
+}
+
 /// /Users/me/Downloads -> ~/Downloads
 fn tilde(p: &Path) -> String {
     match p.strip_prefix(home()) {
@@ -726,23 +736,28 @@ impl Render for Main {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let dir = self.dir.lock().unwrap().clone();
         let ring = self.ring;
+        // The paste hint, or the last paste's result for 4 s. One truncated line beside the button,
+        // so neither the button nor the list moves when the text changes.
+        let (note_color, note_text) = match self.note {
+            Some((color, text)) => (color, SharedString::from(text)),
+            None => (MUTED, format!("or press {PASTE_KEY} anywhere").into()),
+        };
+        let any_done = self.rows.iter().any(|r| matches!(r.state, State::Done));
+        let running = self.rows.iter().filter(|r| matches!(r.state, State::Running(..))).count();
+        let queued = self.rows.iter().filter(|r| matches!(r.state, State::Queued)).count();
+        let summary =
+            [(running > 0).then(|| format!("{running} downloading")), (queued > 0).then(|| format!("{queued} queued"))]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" · ");
         let header = div()
             .flex()
             .flex_none()
             .items_center()
-            .gap_2()
+            .gap_3()
             .px_4()
-            .pt_3()
-            .pb_2()
-            .child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .min_w_0()
-                    .gap_1p5()
-                    .child(div().flex_none().text_color(rgb(MUTED)).child("Saving to"))
-                    .child(div().min_w_0().truncate().child(tilde(&dir))),
-            )
+            .py_3()
             .child(
                 button_base("paste", "Add from clipboard", ring)
                     .gap_2()
@@ -753,23 +768,26 @@ impl Render for Main {
                     .child(div().text_xs().text_color(rgb(MUTED)).child(PASTE_KEY))
                     .on_click(cx.listener(|this, _, _, cx| this.paste(cx))),
             )
-            .child(ghost("change-dir", "Change…", ring).on_click(cx.listener(|this, _, _, cx| this.choose_dir(cx))))
-            .child(button("open-dir", "Open folder", ring).on_click(move |_, _, cx| cx.open_with_system(&dir)));
-
-        // Always one line tall, hint or result, so nothing below moves when a result appears.
-        let (note_color, note_text) = match self.note {
-            Some((color, text)) => (color, SharedString::from(text)),
-            None => (MUTED, format!("Copy a YouTube link, then press {PASTE_KEY} anywhere in this window.").into()),
-        };
-        let note = div()
-            .flex_none()
-            .h(px(16.))
-            .px_4()
-            .mb_2()
-            .text_xs()
-            .text_color(rgb(note_color))
-            .truncate()
-            .child(note_text);
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_xs()
+                    .text_color(rgb(note_color))
+                    .text_ellipsis()
+                    .line_clamp(1)
+                    .child(note_text),
+            )
+            .child(div().flex_none().text_xs().text_color(rgb(MUTED)).child(summary))
+            .when(any_done, |d| {
+                d.child(ghost("clear-done", "Clear completed", ring).h(px(24.)).px_2().text_xs().on_click(cx.listener(
+                    |this, _, window, cx| {
+                        window.focus(&this.focus);
+                        this.rows.retain(|r| !matches!(r.state, State::Done));
+                        cx.notify();
+                    },
+                )))
+            });
 
         let rows = self.rows.iter().rev().map(|r| {
             // 16:9 preview; grey box until the thumbnail arrives.
@@ -779,7 +797,8 @@ impl Render for Main {
                 None => thumb,
             };
             // Until yt-dlp reports the title, the "title" is the raw URL: keep it quiet.
-            let title = div().text_size(px(14.)).line_height(px(20.)).truncate().child(r.title.clone());
+            let title =
+                div().text_size(px(14.)).line_height(px(20.)).text_ellipsis().line_clamp(1).child(r.title.clone());
             let title = match r.state {
                 State::Queued => title.text_color(rgb(MUTED)),
                 _ => title.font_weight(FontWeight::MEDIUM),
@@ -794,7 +813,11 @@ impl Render for Main {
                 State::Failed(e) => (format!("Failed: {e}"), RED),
             };
             let meta = div().text_xs().text_color(rgb(color)).child(text);
-            let meta = if matches!(r.state, State::Failed(_)) { meta.line_clamp(2) } else { meta.truncate() };
+            let meta = if matches!(r.state, State::Failed(_)) {
+                meta.text_ellipsis().line_clamp(2)
+            } else {
+                meta.text_ellipsis().line_clamp(1)
+            };
             // The bar's slot is always there (empty unless running), so the text never moves when it appears.
             let bar = div().mt_0p5().h_1().w_full().rounded_full();
             let bar = match r.state {
@@ -876,15 +899,6 @@ impl Render for Main {
             Kind::Ok => GREEN,
             Kind::Warn => AMBER,
         };
-        let running = self.rows.iter().filter(|r| matches!(r.state, State::Running(..))).count();
-        let queued = self.rows.iter().filter(|r| matches!(r.state, State::Queued)).count();
-        let summary =
-            [(running > 0).then(|| format!("{running} downloading")), (queued > 0).then(|| format!("{queued} queued"))]
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>()
-                .join(" · ");
-        let any_done = self.rows.iter().any(|r| matches!(r.state, State::Done));
         let has_detail = !s.detail.is_empty();
         let open = self.details_open && has_detail;
         let status_bar = div()
@@ -914,29 +928,72 @@ impl Render for Main {
                     .px_4()
                     .text_xs()
                     .text_color(rgb(MUTED))
-                    .child(div().size(px(6.)).flex_none().rounded_full().bg(rgb(dot)))
-                    .child(div().min_w_0().truncate().child(s.text.clone()))
-                    .when(has_detail, |d| {
-                        d.child(
-                            ghost("details", if open { "Hide" } else { "Details" }, ring).h(px(24.)).px_2().on_click(
-                                cx.listener(|this, _, _, cx| {
-                                    this.details_open = !this.details_open;
-                                    cx.notify();
-                                }),
+                    // Status left (natural width, at most 55%), folder right (the rest). Tab order follows
+                    // layout: Add, Clear completed, row buttons, Details, folder, Change….
+                    // Here and in the rows, line_clamp + text_ellipsis instead of truncate(): gpui 0.2.2
+                    // caches a nowrap text's first measurement, so truncate() in a flex row clips without "…".
+                    .child(
+                        div()
+                            .flex()
+                            .flex_initial()
+                            .max_w(gpui::relative(0.55))
+                            .min_w_0()
+                            .items_center()
+                            .gap_2()
+                            .child(div().size(px(6.)).flex_none().rounded_full().bg(rgb(dot)))
+                            .child(div().min_w_0().text_ellipsis().line_clamp(1).child(s.text.clone()))
+                            .when(has_detail, |d| {
+                                d.child(
+                                    // Fixed width: "Details" -> "Hide" must not move the folder.
+                                    ghost("details", if open { "Hide" } else { "Details" }, ring)
+                                        .h(px(24.))
+                                        .w(px(56.))
+                                        .justify_center()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.details_open = !this.details_open;
+                                            cx.notify();
+                                        })),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_1()
+                            .min_w_0()
+                            .items_center()
+                            .justify_end()
+                            .gap_1()
+                            // The download folder itself is the "open folder" control: a ghost button
+                            // whose label is the path, so it shrinks and truncates instead of a fixed label.
+                            .child(
+                                div()
+                                    .id("open-dir")
+                                    .tab_index(0)
+                                    .border_1()
+                                    .border_color(transparent_black())
+                                    .when(ring, |d| d.focus(|s| s.border_color(rgb(BLUE))))
+                                    .flex()
+                                    .flex_initial()
+                                    .min_w_0()
+                                    .items_center()
+                                    .h(px(24.))
+                                    .px_2()
+                                    .rounded(px(6.))
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(rgb(RAISED)).text_color(rgb(TEXT)))
+                                    .active(|s| s.bg(rgb(RAISED_HOVER)).text_color(rgb(TEXT)))
+                                    .tooltip(|_, cx| cx.new(|_| Tip("Open folder")).into())
+                                    .child(div().min_w_0().text_ellipsis().line_clamp(1).child(tilde(&dir)))
+                                    .on_click(move |_, _, cx| cx.open_with_system(&dir)),
+                            )
+                            .child(
+                                ghost("change-dir", "Change…", ring)
+                                    .h(px(24.))
+                                    .px_2()
+                                    .on_click(cx.listener(|this, _, _, cx| this.choose_dir(cx))),
                             ),
-                        )
-                    })
-                    .child(div().flex_1())
-                    .child(div().flex_none().child(summary))
-                    .when(any_done, |d| {
-                        d.child(ghost("clear-done", "Clear completed", ring).h(px(24.)).px_2().on_click(cx.listener(
-                            |this, _, window, cx| {
-                                window.focus(&this.focus);
-                                this.rows.retain(|r| !matches!(r.state, State::Done));
-                                cx.notify();
-                            },
-                        )))
-                    }),
+                    ),
             );
 
         div()
@@ -968,7 +1025,6 @@ impl Render for Main {
             .text_color(rgb(TEXT))
             .text_size(px(13.))
             .child(header)
-            .child(note)
             .child(list)
             .child(status_bar)
     }
