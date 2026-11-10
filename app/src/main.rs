@@ -19,8 +19,26 @@ const PORT: u16 = 47321;
 // Origin, so it is the only check needed while the server can do no more than queue YouTube URLs.
 const EXTENSION_ORIGIN: &str = "chrome-extension://nmiolemafidjgnibgjgjooceilfpdoaf";
 const MAX_BODY: usize = 1 << 20; // cookies for youtube.com fit easily in 1 MB
-// Same codec on every download: VP9 video + Opus audio, muxed into MKV.
-const FORMAT: &str = "bv[vcodec~='^(vp9|vp09)']+ba[acodec=opus]";
+// Same codecs in every file: VP9 video + Opus audio in MKV. Without Opus, take the best non-webm
+// audio (AAC on YouTube); MERGE_ARGS then converts only that audio to Opus.
+// ponytail: non-webm because the container is what tells the two cases apart (see MERGE_ARGS);
+// a webm audio that is not Opus (Vorbis, gone from YouTube) would be remuxed unconverted.
+const FORMAT: &str = "bv[vcodec~='^(vp9|vp09)']+ba[acodec=opus]/bv[vcodec~='^(vp9|vp09)']+ba[ext!=webm]";
+// VP9 + Opus fits webm, so yt-dlp merges it there; anything else falls to mp4. The remuxer then
+// copies webm into mkv untouched, and the convertor turns mp4 into mkv, copying the video and
+// encoding the audio to Opus. 160k is a bit above YouTube's own Opus (about 130-160k), so a second
+// lossy pass from AAC costs little. A plain "mkv" (not "webm>mkv") also tells yt-dlp the final
+// extension, so a file already downloaded is found and skipped, as before.
+const MERGE_ARGS: [&str; 8] = [
+    "--merge-output-format",
+    "webm/mp4",
+    "--remux-video",
+    "mkv",
+    "--use-postprocessor",
+    "FFmpegVideoConvertor:preferedformat=mp4>mkv",
+    "--postprocessor-args",
+    "VideoConvertor:-c:v copy -c:a libopus -b:a 160k",
+];
 
 actions!(ytgrab, [FocusNext, FocusPrev, Paste]);
 
@@ -60,13 +78,15 @@ fn status(kind: Kind, text: impl Into<String>, detail: impl Into<String>) -> Sta
     Status { kind, text: text.into(), detail: detail.into() }
 }
 
-/// What a running job is doing. FORMAT always downloads the video first, then the audio, then merges.
+/// What a running job is doing. FORMAT always downloads the video first, then the audio, then merges,
+/// then (only without Opus audio) converts the audio.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Phase {
     Starting,
     Video,
     Audio,
     Merging,
+    Converting,
 }
 
 enum Msg {
@@ -206,7 +226,8 @@ fn parse_pct(line: &str) -> Option<f32> {
 }
 
 /// Each file yt-dlp starts announces a "Destination" (or "has already been downloaded" when it is
-/// on disk from an earlier try); the merge step prints "[Merger]".
+/// on disk from an earlier try); the merge step prints "[Merger]". The audio conversion prints
+/// "[VideoConvertor] Converting"; without it, it prints "[VideoConvertor] Not converting".
 fn next_phase(phase: Phase, line: &str) -> Phase {
     let new_file = line.starts_with("[download] Destination:")
         || (line.starts_with("[download] ") && line.ends_with("has already been downloaded"));
@@ -214,6 +235,8 @@ fn next_phase(phase: Phase, line: &str) -> Phase {
         if phase == Phase::Video { Phase::Audio } else { Phase::Video }
     } else if line.starts_with("[Merger]") {
         Phase::Merging
+    } else if line.starts_with("[VideoConvertor] Converting") {
+        Phase::Converting
     } else {
         phase
     }
@@ -251,8 +274,6 @@ fn ytdlp_args(dir: &Path, cookie_file: Option<&Path>, ffmpeg: Option<&Path>, url
     let mut args: Vec<std::ffi::OsString> = [
         "-f",
         FORMAT,
-        "--merge-output-format",
-        "mkv",
         "--newline",
         "--no-playlist",
         "--embed-metadata",
@@ -273,6 +294,7 @@ fn ytdlp_args(dir: &Path, cookie_file: Option<&Path>, ffmpeg: Option<&Path>, url
     ]
     .map(Into::into)
     .into();
+    args.extend(MERGE_ARGS.map(Into::into));
     args.extend(["-P".into(), dir.into()]);
     if let Some(cookie_file) = cookie_file {
         args.extend(["--cookies".into(), cookie_file.into()]);
@@ -324,7 +346,7 @@ fn run_job(job: &Job, dir: &Path, version: &str, ui: &Sender<Msg>) -> Result<(),
             let line = String::from_utf8_lossy(&buf).trim_end_matches(['\r', '\n']).to_string();
             buf.clear();
             let next = next_phase(phase, &line);
-            if next == Phase::Merging && phase != Phase::Merging {
+            if next != phase && matches!(next, Phase::Merging | Phase::Converting) {
                 let _ = ui.send(Msg::Progress { id: job.id, pct: 100., phase: next });
             }
             phase = next;
@@ -394,7 +416,7 @@ fn explain(stderr: &str) -> String {
     } else if has(&["video unavailable", "video is unavailable", "has been removed", "not available in your country"]) {
         "This video is unavailable (removed, blocked or not available in your country)."
     } else if has(&["requested format is not available"]) {
-        "This video has no VP9 + Opus version, which ytgrab needs."
+        "This video has no VP9 version, which ytgrab needs."
     } else if has(&["http error 403"]) {
         // Before the network branch: "Unable to download webpage: HTTP Error 403" is not a network problem.
         "YouTube refused the download (HTTP 403). Restart ytgrab to update yt-dlp, then Retry."
@@ -809,6 +831,7 @@ impl Render for Main {
                 State::Running(p, Phase::Video) => (format!("Downloading video {p:.1}%"), BLUE),
                 State::Running(p, Phase::Audio) => (format!("Downloading audio {p:.1}%"), BLUE),
                 State::Running(_, Phase::Merging) => ("Merging video and audio…".to_string(), BLUE),
+                State::Running(_, Phase::Converting) => ("Converting audio to Opus…".to_string(), BLUE),
                 State::Done => ("Done".to_string(), GREEN),
                 State::Failed(e) => (format!("Failed: {e}"), RED),
             };
@@ -1145,6 +1168,28 @@ mod tests {
         ] {
             p = next_phase(p, line);
             assert_eq!(p, want, "{line}");
+        }
+        // Real yt-dlp lines: VP9 + Opus is only remuxed (no conversion), VP9 + AAC gets its audio converted.
+        for (lines, want) in [
+            (
+                [
+                    "[Merger] Merging formats into \"/out/Me at the zoo [jNQXAC9IVRw].webm\"",
+                    "[VideoConvertor] Not converting media file \"/out/Me at the zoo [jNQXAC9IVRw].webm\"; could not find a mapping for webm",
+                    "[VideoRemuxer] Remuxing video from webm to mkv; Destination: /out/Me at the zoo [jNQXAC9IVRw].mkv",
+                ],
+                Phase::Merging,
+            ),
+            (
+                [
+                    "[Merger] Merging formats into \"/out/x [_b-2C3KPAM0].mp4\"",
+                    "[VideoConvertor] Converting video from mp4 to mkv; Destination: /out/x [_b-2C3KPAM0].mkv",
+                    "[VideoRemuxer] Not remuxing media file \"/out/x [_b-2C3KPAM0].mkv\"; already is in target format mkv",
+                ],
+                Phase::Converting,
+            ),
+        ] {
+            let p = lines.iter().fold(Phase::Audio, |p, line| next_phase(p, line));
+            assert_eq!(p, want, "{lines:?}");
         }
         // A retry where both files are already on disk.
         let mut p = Phase::Starting;

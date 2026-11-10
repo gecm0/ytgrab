@@ -26,7 +26,7 @@
 ## What it does
 
 - **A Download button on YouTube**, right next to Like and Share. The toolbar icon works too.
-- **Always the best quality**, always the same format: VP9 video + Opus audio in an MKV file.
+- **Always the best quality**, always the same format: VP9 video + Opus audio in an MKV file. If a video has no Opus audio, its best audio is converted to Opus (160 kbps); the video is never re-encoded.
 - **A small queue app** with thumbnails, progress, Play, Show in folder and Retry.
 - **Works with your login.** The extension passes your YouTube cookies, so videos that need you to be signed in work too.
 - **Stays up to date.** yt-dlp updates itself every time the app starts.
@@ -71,7 +71,7 @@ Files go to `~/Downloads` by default. Pick another folder with **Change…** in 
 
 ## Good to know
 
-- **Videos without VP9 video and Opus audio fail on purpose**, so every file uses the same codecs.
+- **Videos without VP9 video fail on purpose**, so every file uses the same codecs.
 - **Unlisted videos work** like public ones. **Private videos** only work if the account you are signed in with was given access. **Members-only videos** only work if that account is a member of the channel at the required level.
 - **Heavy use with a logged-in account** can get that account rate-limited or flagged by YouTube.
 - **Cookies never stay on disk.** They are written to a temp file per download and deleted right after.
