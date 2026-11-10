@@ -66,7 +66,14 @@ enum Msg {
     Thumb { id: usize, path: PathBuf },
     File { id: usize, path: PathBuf },
     Progress { id: usize, pct: f32, phase: Phase },
-    Done { id: usize, result: Result<(), String> },
+    Done { id: usize, result: Result<(), Failure> },
+}
+
+/// A failed job: `short` goes on the row, `detail` behind "Details" in the status bar.
+#[derive(Debug)]
+struct Failure {
+    short: String,
+    detail: String,
 }
 
 // ---------- paths ----------
@@ -224,14 +231,21 @@ fn fetch_thumb(job_id: usize, video_id: &str, ui: &Sender<Msg>) {
     });
 }
 
-fn run_job(job: &Job, dir: &Path, ui: &Sender<Msg>) -> Result<(), String> {
+fn run_job(job: &Job, dir: &Path, version: &str, ui: &Sender<Msg>) -> Result<(), Failure> {
     let cookie_file = std::env::temp_dir().join(format!("ytgrab-cookies-{}.txt", job.id));
-    std::fs::write(&cookie_file, &job.cookies).map_err(|e| e.to_string())?;
+    std::fs::write(&cookie_file, &job.cookies).map_err(|e| Failure {
+        short: "Cannot write a temporary file. Check free space on the system drive.".into(),
+        detail: format!("Writing {}: {e}", cookie_file.display()),
+    })?;
 
     let mut cmd = command(tool("yt-dlp"));
     cmd.args(["-f", FORMAT, "--merge-output-format", "mkv", "--newline", "--no-playlist", "--embed-metadata"])
         // --print would imply --quiet/--simulate; keep progress lines and the real download.
         .args(["--no-quiet", "--no-simulate"])
+        // A Windows pipe gets the ANSI code page by default: accented titles turned into bytes that
+        // are not UTF-8, which stopped our reader, closed the pipe, and made yt-dlp's next write fail
+        // with "[Errno 22] Invalid argument". yt-dlp encodes all its output with this instead.
+        .args(["--encoding", "utf-8"])
         .args(["--print", "before_dl:YTGRAB_INFO %(id)s %(title)s"])
         .args(["--print", "after_move:YTGRAB_FILE %(filepath)s"])
         .arg("-P")
@@ -250,15 +264,23 @@ fn run_job(job: &Job, dir: &Path, ui: &Sender<Msg>) -> Result<(), String> {
     }
 
     let result = (|| {
-        let mut child = cmd.spawn().map_err(|e| format!("cannot start yt-dlp: {e}"))?;
+        let mut child = cmd.spawn().map_err(|e| Failure {
+            short: "yt-dlp is missing. Put it in bin/ next to the app.".into(),
+            detail: format!("Cannot start {}: {e}", tool("yt-dlp").display()),
+        })?;
         let stderr = child.stderr.take().unwrap();
         let err_reader = std::thread::spawn(move || {
-            let mut s = String::new();
-            let _ = BufReader::new(stderr).read_to_string(&mut s);
-            s
+            let mut b = Vec::new();
+            let _ = BufReader::new(stderr).read_to_end(&mut b);
+            String::from_utf8_lossy(&b).into_owned()
         });
         let mut phase = Phase::Starting;
-        for line in BufReader::new(child.stdout.take().unwrap()).lines().map_while(Result::ok) {
+        // Read to EOF whatever the bytes are: stopping early closes the pipe under yt-dlp.
+        let mut out = BufReader::new(child.stdout.take().unwrap());
+        let mut buf = Vec::new();
+        while out.read_until(b'\n', &mut buf).is_ok_and(|n| n > 0) {
+            let line = String::from_utf8_lossy(&buf).trim_end_matches(['\r', '\n']).to_string();
+            buf.clear();
             let next = next_phase(phase, &line);
             if next == Phase::Merging && phase != Phase::Merging {
                 let _ = ui.send(Msg::Progress { id: job.id, pct: 100., phase: next });
@@ -279,19 +301,111 @@ fn run_job(job: &Job, dir: &Path, ui: &Sender<Msg>) -> Result<(), String> {
                 let _ = ui.send(Msg::File { id: job.id, path: PathBuf::from(path) });
             }
         }
-        let status = child.wait().map_err(|e| e.to_string())?;
+        let status = child.wait();
         let stderr = err_reader.join().unwrap_or_default();
-        if status.success() {
-            Ok(())
-        } else {
-            let last = stderr.lines().filter(|l| l.starts_with("ERROR")).last();
-            Err(last.unwrap_or("yt-dlp failed").to_string())
-        }
+        let code = match status {
+            Ok(s) if s.success() => return Ok(()),
+            Ok(s) => s.code().map_or("none (killed)".to_string(), |c| c.to_string()),
+            Err(e) => format!("unknown ({e})"),
+        };
+        let short = scrub_cookies(&explain(&stderr), &job.cookies);
+        Err(Failure { short, detail: details(&stderr, &code, dir, version, &job.cookies) })
     })();
 
     // Cookies are credentials: always delete, whatever happened.
     let _ = std::fs::remove_file(&cookie_file);
     result
+}
+
+/// One plain-English line for the row: what went wrong and what to do. Matches yt-dlp's ERROR lines
+/// (or the whole output when a crash left none) against the usual causes.
+fn explain(stderr: &str) -> String {
+    let errors: Vec<&str> = stderr.lines().filter(|l| l.starts_with("ERROR")).collect();
+    let text = if errors.is_empty() { stderr.to_string() } else { errors.join("\n") }.to_lowercase();
+    let has = |pats: &[&str]| pats.iter().any(|p| text.contains(p));
+    let msg = if has(&["ffmpeg is not installed", "ffmpeg not found"]) {
+        "ffmpeg is missing. Put ffmpeg in bin/ next to the app."
+    } else if has(&["no space left", "errno 28", "winerror 112"]) {
+        "The disk is full. Free some space or pick another folder with Change…"
+    } else if has(&["permission denied", "errno 13", "winerror 5]"]) {
+        "No permission to write to the download folder. Pick another folder with Change…"
+    } else if has(&["errno 36", "winerror 206", "file name too long"]) {
+        "The file path is too long. Pick a shorter folder with Change…"
+    } else if has(&["errno 22", "invalid argument"]) {
+        "Windows refused a file write (invalid argument). Retry; if it fails again, send screenshots of Details (scroll to the end)."
+    } else if has(&["not a bot"]) {
+        "YouTube asked to confirm you are not a bot. Sign in to YouTube in Chrome, wait a while, then Retry."
+    } else if has(&["confirm your age", "age-restricted", "inappropriate for some users"]) {
+        "This video has an age check. Sign in to YouTube in Chrome, then Retry."
+    } else if has(&["private video"]) {
+        "This video is private."
+    } else if has(&["members-only", "join this channel", "sign in"]) {
+        "This video needs you signed in. Sign in to YouTube in Chrome, then Retry."
+    } else if has(&["video unavailable", "video is unavailable", "has been removed", "not available in your country"]) {
+        "This video is unavailable (removed, blocked or not available in your country)."
+    } else if has(&["requested format is not available"]) {
+        "This video has no VP9 + Opus version, which ytgrab needs."
+    } else if has(&[
+        "unable to download webpage",
+        "getaddrinfo",
+        "timed out",
+        "connection reset",
+        "connection refused",
+        "network is unreachable",
+        "temporary failure in name resolution",
+        "http error 5",
+    ]) {
+        "Network problem. Check your connection, then Retry."
+    } else if has(&["http error 403", "yt-dlp -u", "nsig", "precondition check failed", "unable to extract"]) {
+        "yt-dlp may be out of date. Restart ytgrab to update it, then Retry."
+    } else {
+        // Unknown: the raw ERROR line, else the last line (the exception of a Python traceback).
+        let last = errors.last().copied().or_else(|| stderr.lines().rev().find(|l| !l.trim().is_empty()));
+        return last.map_or("yt-dlp failed with no message".into(), |l| l.trim_start_matches("ERROR: ").to_string());
+    };
+    msg.to_string()
+}
+
+/// The text behind "Details": exit code, version, folder and the last lines yt-dlp printed on
+/// stderr. Never shows cookie values.
+fn details(stderr: &str, code: &str, dir: &Path, version: &str, cookies: &str) -> String {
+    let lines: Vec<&str> = stderr.lines().filter(|l| !l.trim().is_empty()).collect();
+    let tail = lines[lines.len().saturating_sub(20)..].join("\n");
+    let text =
+        format!("Exit code {code} · yt-dlp {version} · Folder {}\nLast lines from yt-dlp:\n{tail}", dir.display());
+    scrub_cookies(&text, cookies)
+}
+
+/// Hides cookie values: Netscape cookie lines (tab-separated), Cookie headers, the bad lines yt-dlp
+/// echoes in "skipping cookie file entry ... : '<line>'", and every value from this job's cookie file.
+fn scrub_cookies(text: &str, cookies: &str) -> String {
+    let mut out: Vec<String> = text
+        .lines()
+        .map(|l| {
+            if l.contains('\t') {
+                return "[line hidden: may hold cookies]".to_string();
+            }
+            if let Some(i) = l.find("cookie file entry") {
+                return format!("{}cookie file entry [hidden]", &l[..i]);
+            }
+            // ASCII lowercase keeps byte offsets valid for &l[..i].
+            match l.to_ascii_lowercase().find("cookie:") {
+                Some(i) => format!("{}cookie: [hidden]", &l[..i]),
+                None => l.to_string(),
+            }
+        })
+        .collect();
+    // ponytail: values under 8 chars ("1", "en") are left alone; they are not secrets and replacing
+    // them would mangle ordinary text.
+    // The last field, not the 7th: malformed lines (the ones yt-dlp complains about) have fewer.
+    let values =
+        cookies.lines().filter(|l| l.contains('\t')).filter_map(|l| l.rsplit('\t').next()).filter(|v| v.len() >= 8);
+    for v in values {
+        for line in &mut out {
+            *line = line.replace(v, "[hidden]");
+        }
+    }
+    out.join("\n")
 }
 
 /// One worker, one job at a time. Updating first means yt-dlp.exe is never replaced while running.
@@ -317,10 +431,17 @@ fn work(jobs: Receiver<Job>, dir: Arc<Mutex<PathBuf>>, ui: Sender<Msg>) {
         Err(e) => status(Kind::Warn, "yt-dlp not found. Put it in bin/ next to the app.", e.to_string()),
     };
     let _ = ui.send(Msg::Status(msg));
+    // Once per start, for Details when a job fails.
+    let version = command(tool("yt-dlp"))
+        .arg("--version")
+        .stdin(Stdio::null())
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_else(|e| format!("unknown ({e})"));
 
     for job in jobs {
         let dir = dir.lock().unwrap().clone(); // folder at the moment the job starts
-        let result = run_job(&job, &dir, &ui);
+        let result = run_job(&job, &dir, &version, &ui);
         let _ = ui.send(Msg::Done { id: job.id, result });
     }
 }
@@ -342,6 +463,7 @@ struct Row {
     thumb: Option<PathBuf>,
     file: Option<PathBuf>,
     state: State,
+    detail: String, // Details text of the last failure, so Retry and other jobs don't lose it
 }
 
 struct Main {
@@ -420,7 +542,16 @@ impl Main {
             return;
         }
         if let Msg::New { id, url, cookies } = msg {
-            self.rows.push(Row { id, title: url.clone(), url, cookies, thumb: None, file: None, state: State::Queued });
+            self.rows.push(Row {
+                id,
+                title: url.clone(),
+                url,
+                cookies,
+                thumb: None,
+                file: None,
+                state: State::Queued,
+                detail: String::new(),
+            });
             return;
         }
         let id = match &msg {
@@ -443,15 +574,22 @@ impl Main {
             Msg::Done { result: Ok(()), .. } => {
                 r.state = State::Done;
                 r.cookies = String::new(); // release the buffer, not just its contents
-                // An older failure shouldn't keep the bar amber once things work again.
+                r.detail = String::new();
+                // Clear the amber bar once things work again, but keep it (and its Details) while
+                // another failed row is still on screen.
+                let failed = self.rows.iter().rev().find(|r| matches!(r.state, State::Failed(_)));
                 if matches!(self.status.text.as_str(), FAILED | RETRYING) {
-                    self.status = status(Kind::Ok, "Download finished", "");
+                    self.status = match failed {
+                        Some(f) => status(Kind::Warn, FAILED, f.detail.clone()),
+                        None => status(Kind::Ok, "Download finished", ""),
+                    };
                 }
             }
-            Msg::Done { result: Err(e), .. } => {
-                // The row clamps the error to 2 lines; Details in the status bar shows all of it.
-                self.status = status(Kind::Warn, FAILED, e.clone());
-                r.state = State::Failed(e);
+            Msg::Done { result: Err(f), .. } => {
+                // The row shows the short line; Details in the status bar shows the raw context.
+                self.status = status(Kind::Warn, FAILED, f.detail.clone());
+                r.detail = f.detail;
+                r.state = State::Failed(f.short);
             }
             Msg::Status(_) | Msg::New { .. } => {}
         }
@@ -461,7 +599,9 @@ impl Main {
         let Some(r) = self.rows.iter_mut().find(|r| r.id == id) else { return };
         r.state = State::Queued;
         if self.status.text == FAILED {
-            self.status = status(Kind::Busy, RETRYING, "");
+            // Keep the previous Details until the retry has its own result.
+            let detail = std::mem::take(&mut self.status.detail);
+            self.status = status(Kind::Busy, RETRYING, detail);
         }
         let _ = self.jobs.send(Job { id, url: r.url.clone(), cookies: r.cookies.clone() });
     }
@@ -534,7 +674,7 @@ impl Render for Main {
                 State::Running(p, Phase::Audio) => (format!("Downloading audio {p:.1}%"), BLUE),
                 State::Running(_, Phase::Merging) => ("Merging video and audio…".to_string(), BLUE),
                 State::Done => ("Done".to_string(), GREEN),
-                State::Failed(e) => (format!("Failed: {}", e.strip_prefix("ERROR: ").unwrap_or(e)), RED),
+                State::Failed(e) => (format!("Failed: {e}"), RED),
             };
             let meta = div().text_xs().text_color(rgb(color)).child(text);
             let meta = if matches!(r.state, State::Failed(_)) { meta.line_clamp(2) } else { meta.truncate() };
@@ -639,7 +779,18 @@ impl Render for Main {
             .border_t_1()
             .border_color(rgb(LINE))
             .when(open, |d| {
-                d.child(div().px_4().pt(px(10.)).text_xs().text_color(rgb(WARN_TEXT)).child(s.detail.clone()))
+                // ~25 lines of yt-dlp output: cap the height so the list stays visible, scroll the rest.
+                d.child(
+                    div()
+                        .id("detail")
+                        .max_h(px(200.))
+                        .overflow_y_scroll()
+                        .px_4()
+                        .pt(px(10.))
+                        .text_xs()
+                        .text_color(rgb(WARN_TEXT))
+                        .child(s.detail.clone()),
+                )
             })
             .child(
                 div()
@@ -860,5 +1011,103 @@ mod tests {
         assert!(parse_job("POST", "/job", ext, flag).is_err());
         assert!(is_youtube_url("https://youtu.be/abc"));
         assert!(!is_youtube_url("http://www.youtube.com/watch?v=a"));
+    }
+
+    // AGE, NETWORK and the unavailable/format/permission lines were captured from yt-dlp 2026.08.19;
+    // the bot-check and private-video lines are the messages YouTube sends, as quoted in yt-dlp issues.
+    const AGE: &str = "ERROR: [youtube] 07FYdnEawAQ: Sign in to confirm your age. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies.";
+    const NETWORK: &str = "ERROR: [youtube] 8YzunYUBQsg: Unable to download API page: ('Unable to connect to proxy', NewConnectionError(\"HTTPSConnection(host='127.0.0.1', port=9): Failed to establish a new connection: [Errno 61] Connection refused\")); please report this issue on  https://github.com/yt-dlp/yt-dlp/issues?q= , filling out the appropriate issue template. Confirm you are on the latest version using  yt-dlp -U";
+    // The pipe failure as reproduced here (Errno 32 on macOS); Windows reports it as Errno 22.
+    const ERRNO22: &str =
+        "[youtube] 8YzunYUBQsg: Downloading webpage\nERROR: unable to open for writing: [Errno 22] Invalid argument";
+    const ERRNO22_TRACEBACK: &str = "Traceback (most recent call last):\n  File \"yt_dlp\\__main__.py\", line 17, in <module>\n  File \"yt_dlp\\utils\\_utils.py\", line 1504, in write_string\nOSError: [Errno 22] Invalid argument";
+
+    #[test]
+    fn error_mapping() {
+        for (stderr, want) in [
+            (ERRNO22, "Windows refused a file write"),
+            (ERRNO22_TRACEBACK, "Windows refused a file write"),
+            (AGE, "age check"),
+            (NETWORK, "Network problem"),
+            ("ERROR: [youtube] aaaaaaaaaaa: This video is unavailable", "unavailable"),
+            (
+                "ERROR: [youtube] x: Sign in to confirm you\u{2019}re not a bot. Use --cookies-from-browser or --cookies for the authentication.",
+                "not a bot",
+            ),
+            ("ERROR: [youtube] x: Private video. Sign in if you've been granted access to this video", "private"),
+            (
+                "ERROR: [youtube] 8YzunYUBQsg: Requested format is not available. Use --list-formats for a list of available formats",
+                "VP9",
+            ),
+            ("ERROR: unable to open for writing: [Errno 13] Permission denied: '/tmp/ro/a.webm.part'", "No permission"),
+            ("ERROR: unable to write data: [Errno 28] No space left on device", "disk is full"),
+            (
+                "ERROR: Postprocessing: ffmpeg not found. Please install or provide the path using --ffmpeg-location",
+                "ffmpeg is missing",
+            ),
+            ("ERROR: unable to download video data: HTTP Error 403: Forbidden", "out of date"),
+        ] {
+            let got = explain(stderr);
+            assert!(got.contains(want), "{stderr}\n-> {got}");
+        }
+        // Unknown errors fall back to the raw line, without the ERROR prefix.
+        assert_eq!(explain("WARNING: a\nERROR: something new"), "something new");
+        assert_eq!(explain("Traceback (most recent call last):\nValueError: boom\n"), "ValueError: boom");
+        assert_eq!(explain(""), "yt-dlp failed with no message");
+    }
+
+    #[test]
+    fn details_text() {
+        let sid = "g.a000abcDEFsecretSIDvalue123";
+        let cookies = format!(
+            "# Netscape HTTP Cookie File\n#HttpOnly_.youtube.com\tTRUE\t/\tTRUE\t1893456000\tSID\t{sid}\n.youtube.com\tTRUE\t/\tFALSE\t0\tPREF\tf6=8\n"
+        );
+        let mut stderr: String = (1..=30).map(|i| format!("line {i}\n")).collect();
+        // Real yt-dlp warning (cookies.py) for a malformed line: repr() turns its tabs into "\t".
+        stderr += &format!(
+            "WARNING: skipping cookie file entry due to invalid length 6: '.youtube.com\\tTRUE\\t/\\tFALSE\\tSAPISID\\tshort1'\n"
+        );
+        stderr += &format!(
+            "[debug] Cookie: SID={sid}; PREF=f6=8\n.youtube.com\tTRUE\t/\tFALSE\t0\tPREF\tf6=8\nERROR: oops {sid}\n"
+        );
+        let d = details(&stderr, "1", Path::new("D:/Descargas"), "2026.08.19", &cookies);
+        assert!(!d.contains(sid) && !d.contains("f6=8") && !d.contains("short1"), "{d}");
+        assert!(d.starts_with("Exit code 1 · yt-dlp 2026.08.19 · Folder D:/Descargas\n"), "{d}");
+        assert!(d.contains("WARNING: skipping cookie file entry [hidden]"));
+        assert!(d.contains("ERROR: oops [hidden]"));
+        assert!(!d.contains("line 14\n") && d.contains("line 15\n"), "keeps only the last 20 lines: {d}");
+        // A traceback with no ERROR line is kept whole; Windows paths ("\t" in text) are not hidden.
+        let t = details(ERRNO22_TRACEBACK, "1", Path::new("x"), "v", "");
+        assert!(t.ends_with(ERRNO22_TRACEBACK), "{t}");
+        let path = r"ERROR: unable to open for writing: [Errno 22] Invalid argument: 'D:\Descargas\tmp\a.part'";
+        assert!(details(path, "1", Path::new("x"), "v", "").ends_with(path));
+    }
+}
+
+#[cfg(test)]
+mod live {
+    use super::*;
+
+    /// Real yt-dlp + network. Run with PYTHONIOENCODING=cp1252 to get the byte stream a Windows pipe gets:
+    /// PYTHONIOENCODING=cp1252 cargo test live -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn accented_title_with_ansi_stdout() {
+        let dir = std::env::temp_dir().join(format!("ytgrab-live-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let job = Job {
+            id: 999_999,
+            url: "https://www.youtube.com/watch?v=8YzunYUBQsg".into(),
+            cookies: "# Netscape HTTP Cookie File\n".into(),
+        };
+        let r = run_job(&job, &dir, "test", &tx);
+        let msgs: Vec<Msg> = rx.try_iter().collect();
+        let title = msgs.iter().find_map(|m| if let Msg::Title { title, .. } = m { Some(title.clone()) } else { None });
+        let file = msgs.iter().find_map(|m| if let Msg::File { path, .. } = m { Some(path.clone()) } else { None });
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(r.is_ok(), "{r:?}");
+        assert!(title.unwrap_or_default().contains("canción"));
+        assert!(file.is_some_and(|f| f.to_string_lossy().contains("canción")));
     }
 }
