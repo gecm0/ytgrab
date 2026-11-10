@@ -269,9 +269,13 @@ fn ytdlp_args(dir: &Path, cookie_file: &Path, ffmpeg: Option<&Path>, url: &str) 
 
 fn run_job(job: &Job, dir: &Path, version: &str, ui: &Sender<Msg>) -> Result<(), Failure> {
     let cookie_file = std::env::temp_dir().join(format!("ytgrab-cookies-{}.txt", job.id));
-    std::fs::write(&cookie_file, &job.cookies).map_err(|e| Failure {
-        short: "Cannot write a temporary file. Check free space on the system drive.".into(),
-        detail: format!("Writing {}: {e}", cookie_file.display()),
+    std::fs::write(&cookie_file, &job.cookies).map_err(|e| {
+        // A partial write (disk full) can still hold live cookies: delete it here too.
+        let _ = std::fs::remove_file(&cookie_file);
+        Failure {
+            short: "Cannot write a temporary file. Check free space on the system drive.".into(),
+            detail: format!("Writing {}: {e}", cookie_file.display()),
+        }
     })?;
 
     // Bundled ffmpeg lives in bin/ too; yt-dlp only searches PATH by default.
@@ -283,10 +287,7 @@ fn run_job(job: &Job, dir: &Path, version: &str, ui: &Sender<Msg>) -> Result<(),
         .stderr(Stdio::piped());
 
     let result = (|| {
-        let mut child = cmd.spawn().map_err(|e| Failure {
-            short: "yt-dlp is missing. Put it in bin/ next to the app.".into(),
-            detail: format!("Cannot start {}: {e}", tool("yt-dlp").display()),
-        })?;
+        let mut child = cmd.spawn().map_err(|e| spawn_failure(&e))?;
         let stderr = child.stderr.take().unwrap();
         let err_reader = std::thread::spawn(move || {
             let mut b = Vec::new();
@@ -336,6 +337,14 @@ fn run_job(job: &Job, dir: &Path, version: &str, ui: &Sender<Msg>) -> Result<(),
     result
 }
 
+fn spawn_failure(e: &std::io::Error) -> Failure {
+    let short = match e.kind() {
+        std::io::ErrorKind::NotFound => "yt-dlp is missing. Put it in bin/ next to the app.",
+        _ => "Cannot start yt-dlp. See Details.",
+    };
+    Failure { short: short.into(), detail: format!("Cannot start {}: {e}", tool("yt-dlp").display()) }
+}
+
 /// One plain-English line for the row: what went wrong and what to do. Matches yt-dlp's ERROR lines
 /// (or the whole output when a crash left none) against the usual causes.
 fn explain(stderr: &str) -> String {
@@ -353,17 +362,20 @@ fn explain(stderr: &str) -> String {
     } else if has(&["errno 22", "invalid argument"]) {
         "Windows refused a file write (invalid argument). Retry; if it fails again, send screenshots of Details (scroll to the end)."
     } else if has(&["not a bot"]) {
-        "YouTube asked to confirm you are not a bot. Sign in to YouTube in Chrome, wait a while, then Retry."
+        "YouTube asked to confirm you are not a bot. Sign in to YouTube in Chrome, wait a while, then click Download on the video again."
     } else if has(&["confirm your age", "age-restricted", "inappropriate for some users"]) {
-        "This video has an age check. Sign in to YouTube in Chrome, then Retry."
+        "This video has an age check. Sign in to YouTube in Chrome, then click Download on the video again."
     } else if has(&["private video"]) {
         "This video is private."
     } else if has(&["members-only", "join this channel", "sign in"]) {
-        "This video needs you signed in. Sign in to YouTube in Chrome, then Retry."
+        "This video needs you signed in. Sign in to YouTube in Chrome, then click Download on the video again."
     } else if has(&["video unavailable", "video is unavailable", "has been removed", "not available in your country"]) {
         "This video is unavailable (removed, blocked or not available in your country)."
     } else if has(&["requested format is not available"]) {
         "This video has no VP9 + Opus version, which ytgrab needs."
+    } else if has(&["http error 403"]) {
+        // Before the network branch: "Unable to download webpage: HTTP Error 403" is not a network problem.
+        "YouTube refused the download (HTTP 403). Restart ytgrab to update yt-dlp, then Retry."
     } else if has(&[
         "unable to download webpage",
         "getaddrinfo",
@@ -375,7 +387,7 @@ fn explain(stderr: &str) -> String {
         "http error 5",
     ]) {
         "Network problem. Check your connection, then Retry."
-    } else if has(&["http error 403", "yt-dlp -u", "nsig", "precondition check failed", "unable to extract"]) {
+    } else if has(&["yt-dlp -u", "nsig", "precondition check failed", "unable to extract"]) {
         "yt-dlp may be out of date. Restart ytgrab to update it, then Retry."
     } else {
         // Unknown: the raw ERROR line, else the last line (the exception of a Python traceback).
@@ -618,9 +630,8 @@ impl Main {
         let Some(r) = self.rows.iter_mut().find(|r| r.id == id) else { return };
         r.state = State::Queued;
         if self.status.text == FAILED {
-            // Keep the previous Details until the retry has its own result.
-            let detail = std::mem::take(&mut self.status.detail);
-            self.status = status(Kind::Busy, RETRYING, detail);
+            // Keep this row's Details until the retry has its own result.
+            self.status = status(Kind::Busy, RETRYING, r.detail.clone());
         }
         let _ = self.jobs.send(Job { id, url: r.url.clone(), cookies: r.cookies.clone() });
     }
@@ -1077,11 +1088,28 @@ mod tests {
                 "ERROR: Postprocessing: ffmpeg not found. Please install or provide the path using --ffmpeg-location",
                 "ffmpeg is missing",
             ),
-            ("ERROR: unable to download video data: HTTP Error 403: Forbidden", "out of date"),
+            ("ERROR: unable to download video data: HTTP Error 403: Forbidden", "HTTP 403"),
+            (
+                "ERROR: [youtube] x: Unable to download webpage: HTTP Error 403: Forbidden (caused by <HTTPError 403: Forbidden>)",
+                "HTTP 403",
+            ),
+            (
+                "ERROR: [youtube] x: Unable to extract yt initial data; please report this issue on  https://github.com/yt-dlp/yt-dlp/issues?q= , filling out the appropriate issue template. Confirm you are on the latest version using  yt-dlp -U",
+                "out of date",
+            ),
         ] {
             let got = explain(stderr);
             assert!(got.contains(want), "{stderr}\n-> {got}");
         }
+        // Retry reuses the row's old cookies, so sign-in fixes must say "Download again", not "Retry".
+        for m in [AGE, "ERROR: [youtube] x: Sign in to confirm you\u{2019}re not a bot.", "ERROR: x: Join this channel"]
+        {
+            assert!(explain(m).contains("click Download on the video again"), "{m}");
+        }
+        use std::io::{Error, ErrorKind};
+        assert!(spawn_failure(&Error::from(ErrorKind::NotFound)).short.contains("missing"));
+        let denied = spawn_failure(&Error::from(ErrorKind::PermissionDenied));
+        assert!(denied.short.starts_with("Cannot start yt-dlp") && denied.detail.contains("ermission"), "{denied:?}");
         // Unknown errors fall back to the raw line, without the ERROR prefix.
         assert_eq!(explain("WARNING: a\nERROR: something new"), "something new");
         assert_eq!(explain("Traceback (most recent call last):\nValueError: boom\n"), "ValueError: boom");
