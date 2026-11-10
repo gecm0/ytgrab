@@ -682,8 +682,8 @@ impl Main {
         let text = cx.read_from_clipboard().and_then(|c| c.text()).unwrap_or_default();
         let note = match pasted_url(&text) {
             // No worker without the port, so a job would sit in "Queued" forever.
-            _ if !self.working => (AMBER, "Can’t add links while another ytgrab is open."),
-            None => (AMBER, "The clipboard has no YouTube link. Copy one from the address bar or Share."),
+            _ if !self.working => (AMBER, "Close the other ytgrab to add links."),
+            None => (AMBER, "No YouTube link copied."),
             Some(url) => {
                 let (id, url, cookies) = (next_id(), url.to_string(), self.last_cookies.clone());
                 let _ = self.jobs.send(Job { id, url: url.clone(), cookies: cookies.clone() });
